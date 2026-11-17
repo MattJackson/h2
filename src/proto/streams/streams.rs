@@ -77,6 +77,7 @@ pub(crate) struct OpaqueStreamRef {
 /// TODO: better name
 #[derive(Debug)]
 struct Inner {
+    observer: Option<Arc<dyn crate::serialization::Observer>>,
     /// Tracks send & recv stream concurrency.
     counts: Counts,
 
@@ -126,6 +127,13 @@ where
             send_buffer: Arc::new(SendBuffer::new()),
             _p: ::std::marker::PhantomData,
         }
+    }
+
+    pub(crate) fn set_observer(
+        &mut self,
+        observer: Option<Arc<dyn crate::serialization::Observer>>,
+    ) {
+        self.inner.lock().unwrap().observer = observer;
     }
 
     pub fn set_target_connection_window_size(&mut self, size: WindowSize) -> Result<(), Reason> {
@@ -200,7 +208,7 @@ where
 
             let status = {
                 let mut me = self.inner.lock().unwrap();
-                let status = me.buffer_pending(&self.send_buffer, dst)?;
+                let status = me.buffer_pending(&self.send_buffer, dst, cx)?;
 
                 // Register the task while holding the same lock used to
                 // observe that all pending frames have been buffered. A
@@ -455,6 +463,7 @@ impl<B> DynStreams<'_, B> {
 impl Inner {
     fn new(peer: peer::Dyn, config: Config) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Inner {
+            observer: None,
             counts: Counts::new(peer, &config),
             actions: Actions {
                 recv: Recv::new(peer, &config),
@@ -686,6 +695,10 @@ impl Inner {
             return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
         }
 
+        if let Some(observer) = &self.observer {
+            observer.reset(u32::from(id)).map_err(Error::from)?;
+        }
+
         // The GOAWAY process has begun. All streams with a greater ID than
         // specified as part of GOAWAY should be ignored.
         if id > self.actions.recv.max_stream_id() {
@@ -780,6 +793,9 @@ impl Inner {
     }
 
     fn handle_error<B>(&mut self, send_buffer: &SendBuffer<B>, err: proto::Error) -> StreamId {
+        if let Some(observer) = &self.observer {
+            let _ = observer.connection_error();
+        }
         let actions = &mut self.actions;
         let counts = &mut self.counts;
         let mut send_buffer = send_buffer.inner.lock().unwrap();
@@ -974,6 +990,7 @@ impl Inner {
         &mut self,
         send_buffer: &SendBuffer<B>,
         dst: &mut Codec<T, Prioritized<B>>,
+        cx: &mut Context<'_>,
     ) -> io::Result<BufferStatus>
     where
         T: AsyncWrite + Unpin,
@@ -996,11 +1013,13 @@ impl Inner {
         }
 
         // Send any other pending frames
-        if self
-            .actions
-            .send
-            .buffer_pending(send_buffer, &mut self.store, &mut self.counts, dst)?
-            == BufferStatus::CodecFull
+        if self.actions.send.buffer_pending(
+            send_buffer,
+            &mut self.store,
+            &mut self.counts,
+            dst,
+            cx,
+        )? == BufferStatus::CodecFull
         {
             return Ok(BufferStatus::CodecFull);
         }
@@ -1190,6 +1209,10 @@ where
 // ===== impl StreamRef =====
 
 impl<B> StreamRef<B> {
+    pub fn bind_response_identity(&mut self, host: u64) -> Result<(), UserError> {
+        self.opaque.bind_response_identity(host)
+    }
+
     pub fn send_data(&mut self, data: B, end_stream: bool) -> Result<(), UserError>
     where
         B: Buf,
@@ -1463,6 +1486,30 @@ impl<B> Clone for StreamRef<B> {
 // ===== impl OpaqueStreamRef =====
 
 impl OpaqueStreamRef {
+    pub fn bind_response_identity(&mut self, host: u64) -> Result<(), UserError> {
+        let mut inner = self.inner.lock().unwrap();
+        let observer = match &inner.observer {
+            Some(observer) => observer.clone(),
+            None => return Ok(()),
+        };
+        let mut stream = inner.store.resolve(self.key);
+        if let Some(source) = &stream.response_source {
+            return if source.identity() == host {
+                Ok(())
+            } else {
+                Err(UserError::Serialization)
+            };
+        }
+        if host == 0 || stream.state.is_send_closed() {
+            return Err(UserError::Serialization);
+        }
+        let state = observer
+            .bind(u32::from(stream.id), host)
+            .map_err(|_| UserError::Serialization)?;
+        stream.response_source = Some(crate::serialization::Source::new(state, observer));
+        Ok(())
+    }
+
     fn new(inner: Arc<Mutex<Inner>>, stream: &mut store::Ptr) -> OpaqueStreamRef {
         stream.ref_inc();
         OpaqueStreamRef {
@@ -1710,6 +1757,15 @@ fn maybe_cancel(stream: &mut store::Ptr, actions: &mut Actions, counts: &mut Cou
         } else {
             Reason::CANCEL
         };
+
+        if !(counts.peer().is_server()
+            && stream.state.is_send_closed()
+            && stream.state.is_recv_streaming())
+        {
+            if let Some(source) = &stream.response_source {
+                source.abort();
+            }
+        }
 
         actions
             .send

@@ -162,3 +162,5 @@ impl<T, F: FnMut(&mut Context<'_>) -> Poll<T>> Future for PollFn<F> {
         (self.0)(cx)
     }
 }
+
+pub mod serialization;

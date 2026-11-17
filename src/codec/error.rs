@@ -12,6 +12,8 @@ pub enum SendError {
 /// Errors caused by users of the library
 #[derive(Debug)]
 pub enum UserError {
+    /// The exact serialization observer rejected a batch.
+    Serialization,
     /// The stream ID is no longer accepting frames.
     InactiveStreamId,
 
@@ -88,6 +90,7 @@ impl fmt::Display for UserError {
         use self::UserError::*;
 
         fmt.write_str(match *self {
+            Serialization => "serialization observer failed",
             InactiveStreamId => "inactive stream",
             UnexpectedFrameType => "unexpected frame type",
             PayloadTooBig => "payload too big",
