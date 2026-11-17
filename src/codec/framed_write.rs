@@ -376,3 +376,47 @@ mod unstable {
         }
     }
 }
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+    use crate::serialization::{Event, Observer, ResponseState};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Default)]
+    struct Capture(Mutex<Vec<Event>>);
+    impl Observer for Capture {
+        fn record(&self, events: &[Event]) -> io::Result<()> {
+            self.0.lock().unwrap().extend_from_slice(events); Ok(())
+        }
+        fn bind(&self, _wire: u32, host: u64) -> io::Result<Arc<ResponseState>> {
+            Ok(Arc::new(ResponseState::new(host)))
+        }
+        fn reset(&self, _wire: u32) -> io::Result<()> { Ok(()) }
+        fn poll_release(&self, _host: u64, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn chained_data_is_described_once_before_any_write() {
+        let capture = Arc::new(Capture::default());
+        let mut writer = FramedWrite::new(tokio::io::sink());
+        writer.set_observer(capture.clone());
+        let source = crate::serialization::Source::new(
+            Arc::new(ResponseState::new(47)), capture.clone());
+        writer.set_frame_source(Some(source));
+        let mut frame = frame::Data::new(1.into(), bytes::Bytes::from(vec![3; 4096]));
+        frame.set_end_stream(true);
+        writer.buffer(frame.into()).unwrap();
+        let events = capture.0.lock().unwrap().clone();
+        assert_eq!(&events[..4], &[
+            Event::ReleaseBarrier { stream: 47 },
+            Event::Span { stream: 47, payload: false, len: 9 },
+            Event::Span { stream: 47, payload: true, len: 4096 },
+            Event::End { stream: 47 },
+        ]);
+        futures_util::future::poll_fn(|cx| writer.flush(cx)).await.unwrap();
+        assert_eq!(capture.0.lock().unwrap().iter().filter(|e| matches!(e, Event::Span { payload: true, .. })).count(), 1);
+    }
+}
