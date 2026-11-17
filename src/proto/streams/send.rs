@@ -209,6 +209,9 @@ impl Send {
         counts: &mut Counts,
         task: &mut Option<Waker>,
     ) {
+        if let Some(source) = &stream.response_source {
+            source.abort();
+        }
         let is_reset = stream.state.is_reset();
         let is_closed = stream.state.is_closed();
         let is_empty = stream.pending_send.is_empty();
@@ -350,12 +353,14 @@ impl Send {
         store: &mut Store,
         counts: &mut Counts,
         dst: &mut Codec<T, Prioritized<B>>,
+        cx: &mut std::task::Context<'_>,
     ) -> io::Result<BufferStatus>
     where
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        self.prioritize.buffer_pending(buffer, store, counts, dst)
+        self.prioritize
+            .buffer_pending(buffer, store, counts, dst, cx)
     }
 
     pub fn reclaim_written_frame<T, B>(
@@ -490,6 +495,9 @@ impl Send {
         stream: &mut store::Ptr,
         counts: &mut Counts,
     ) {
+        if let Some(source) = &stream.response_source {
+            source.abort();
+        }
         // Clear all pending outbound frames
         self.prioritize.clear_queue(buffer, stream);
         self.prioritize.reclaim_all_capacity(stream, counts);

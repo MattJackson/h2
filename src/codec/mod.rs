@@ -59,6 +59,19 @@ where
 }
 
 impl<T, B> Codec<T, B> {
+    pub(crate) fn set_observer(
+        &mut self,
+        observer: std::sync::Arc<dyn crate::serialization::Observer>,
+    ) {
+        self.framed_write().set_observer(observer);
+    }
+    pub(crate) fn observer(&self) -> Option<std::sync::Arc<dyn crate::serialization::Observer>> {
+        self.inner.get_ref().observer()
+    }
+    pub(crate) fn set_frame_source(&mut self, source: Option<crate::serialization::Source>) {
+        self.framed_write().set_frame_source(source);
+    }
+
     /// Updates the max received frame size.
     ///
     /// The change takes effect the next time a frame is decoded. In other
