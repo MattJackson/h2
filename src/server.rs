@@ -236,6 +236,7 @@ pub struct Connection<T, B: Buf> {
 pub struct Builder {
     /// The label sink, when the connection labels its output.
     labels: Option<std::sync::Arc<dyn crate::serialization::Labels>>,
+
     /// Time to keep locally reset streams around before reaping.
     reset_stream_duration: Duration,
 
@@ -671,13 +672,13 @@ impl Builder {
     /// ```
     pub fn new() -> Builder {
         Builder {
+            labels: None,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
             pending_accept_reset_stream_max: proto::DEFAULT_REMOTE_RESET_STREAM_MAX,
             settings: Settings::default(),
             initial_target_connection_window_size: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
-            labels: None,
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             data_frame_budget: proto::DataFrameBudget::Auto,
         }
@@ -1160,18 +1161,6 @@ impl Default for Builder {
 // ===== impl SendResponse =====
 
 impl<B: Buf> SendResponse<B> {
-    /// Get an admission-time binder for the actual responder stream.
-    pub fn response_identity_binder(&self) -> ResponseIdentityBinder {
-        ResponseIdentityBinder {
-            inner: self.inner.clone_to_opaque(),
-        }
-    }
-
-    /// Bind this concrete wire responder before sending its final response.
-    pub fn bind_response_identity(&mut self, host: u64) -> Result<(), crate::Error> {
-        self.inner.bind_response_identity(host).map_err(Into::into)
-    }
-
     /// Send an interim informational response (1xx status codes)
     ///
     /// This method can be called multiple times before calling `send_response()`
@@ -1813,18 +1802,5 @@ where
             Handshaking::ReadingPreface(_) => f.write_str("ReadingPreface(_)"),
             Handshaking::Done => f.write_str("Done"),
         }
-    }
-}
-
-/// Admission-time identity binder for this exact HTTP/2 responder.
-/// Clones retain the ordinary application reference, never a serializer source.
-#[derive(Clone, Debug)]
-pub struct ResponseIdentityBinder {
-    inner: proto::OpaqueStreamRef,
-}
-impl ResponseIdentityBinder {
-    /// Bind the admitted application identity before publishing the request.
-    pub fn bind(&mut self, host: u64) -> Result<(), crate::Error> {
-        self.inner.bind_response_identity(host).map_err(Into::into)
     }
 }

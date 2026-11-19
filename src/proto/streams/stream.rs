@@ -18,9 +18,6 @@ use std::time::Instant;
 /// (such as an accept queue), this is **not** tracked by a reference count.
 /// Thus, `ref_count` can be zero and the stream still has to be kept around.
 pub(super) struct Stream {
-    pub response_source: Option<crate::serialization::Source>,
-    pub next_release: Option<store::Key>,
-    pub is_release_blocked: bool,
     /// The h2 stream identifier
     pub id: StreamId,
 
@@ -162,9 +159,6 @@ impl Stream {
             .expect("invalid initial send window size");
 
         Stream {
-            response_source: None,
-            next_release: None,
-            is_release_blocked: false,
             id,
             state: State::default(),
             ref_count: 0,
@@ -265,7 +259,7 @@ impl Stream {
             // The stream is not in any queue
             !self.is_pending_send && !self.is_pending_send_capacity &&
             !self.is_pending_accept && !self.is_pending_window_update &&
-            !self.is_pending_open && !self.is_release_blocked && self.reset_at.is_none()
+            !self.is_pending_open && self.reset_at.is_none()
     }
 
     /// Returns true when the consumer of the stream has dropped all handles
@@ -600,25 +594,5 @@ impl store::Next for NextResetExpire {
 impl ContentLength {
     pub fn is_head(&self) -> bool {
         matches!(*self, Self::Head)
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct NextRelease;
-impl store::Next for NextRelease {
-    fn next(stream: &Stream) -> Option<store::Key> {
-        stream.next_release
-    }
-    fn set_next(stream: &mut Stream, key: Option<store::Key>) {
-        stream.next_release = key;
-    }
-    fn take_next(stream: &mut Stream) -> Option<store::Key> {
-        stream.next_release.take()
-    }
-    fn is_queued(stream: &Stream) -> bool {
-        stream.is_release_blocked
-    }
-    fn set_queued(stream: &mut Stream, val: bool) {
-        stream.is_release_blocked = val;
     }
 }
