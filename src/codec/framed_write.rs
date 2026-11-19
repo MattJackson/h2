@@ -30,10 +30,12 @@ pub struct FramedWrite<T, B> {
 
 #[derive(Debug)]
 struct Encoder<B> {
-    observer: Option<std::sync::Arc<dyn crate::serialization::Observer>>,
-    source: Option<crate::serialization::Source>,
+    /// The label sink, when the connection labels its output.
+    labels: Option<std::sync::Arc<dyn crate::serialization::Labels>>,
+    /// The header block being continued ends its stream.
     continuation_end: bool,
-    poisoned: bool,
+    /// How a header frame's payload was placed when it holds sealed values (else empty, no memory).
+    segments: Vec<crate::serialization::Segment>,
     /// HPACK encoder
     hpack: hpack::Encoder,
 
@@ -96,10 +98,9 @@ where
             inner,
             final_flush_done: false,
             encoder: Encoder {
-                observer: None,
-                source: None,
+                labels: None,
                 continuation_end: false,
-                poisoned: false,
+                segments: Vec::new(),
                 hpack: hpack::Encoder::default(),
                 buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
                 next: None,
@@ -139,13 +140,7 @@ where
     /// `poll_ready` must be called first to ensure that a frame may be
     /// accepted.
     pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
-        match self.encoder.buffer(item) {
-            // Internal callers know protocol frames are valid and historically
-            // expect this method to succeed. Surface observer IO failure through
-            // poll_ready/flush instead, before any poisoned bytes can escape.
-            Err(UserError::Serialization) => Ok(()),
-            result => result,
-        }
+        self.encoder.buffer(item)
     }
 
     /// Flush buffered data to the wire
@@ -154,12 +149,6 @@ where
         let _e = span.enter();
 
         loop {
-            if self.encoder.poisoned {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "serialization observer failed",
-                )));
-            }
             while !self.encoder.is_empty() {
                 let n = match self.encoder.next {
                     Some(Next::Data(ref mut frame)) => {
@@ -216,17 +205,25 @@ impl<B> Encoder<B>
 where
     B: Buf,
 {
-    fn record(&mut self, events: &[crate::serialization::Event]) -> Result<(), UserError> {
-        if self.poisoned {
-            return Err(Serialization);
+    /// States the labels of one header frame just encoded for `wire`: the buffer grew from `before`.
+    /// With sealed values the frame's payload is runs of encoded bytes around the sealed places.
+    fn label_header_frame(&mut self, wire: u32, before: usize) {
+        let Some(labels) = &self.labels else {
+            self.segments.clear();
+            return;
+        };
+        if self.segments.is_empty() {
+            labels.span(wire, false, self.buf.get_ref().len() - before);
+            return;
         }
-        if let Some(observer) = &self.observer {
-            if observer.record(events).is_err() {
-                self.poisoned = true;
-                return Err(Serialization);
+        for segment in self.segments.drain(..) {
+            match segment {
+                crate::serialization::Segment::Bytes(len) => labels.span(wire, false, len),
+                crate::serialization::Segment::Sealed { slot, offset, len } => {
+                    labels.sealed(wire, slot, offset, len)
+                }
             }
         }
-        Ok(())
     }
 
     fn unset_frame(&mut self) -> ControlFlow {
@@ -238,44 +235,30 @@ where
         match self.next.take() {
             Some(Next::Data(frame)) => {
                 self.last_data_frame = Some(frame);
-                self.source.take();
                 debug_assert!(self.is_empty());
                 ControlFlow::Break
             }
             Some(Next::Continuation(frame)) => {
-                let host = self.source.as_ref().map_or(0, |source| source.identity());
+                let wire: u32 = frame.stream_id().into();
 
                 // Buffer the continuation frame, then try to write again
                 let mut buf = limited_write_buf!(self);
-                if let Some(continuation) = frame.encode(&mut buf) {
+                if let Some(continuation) = frame.encode(&mut buf, &mut self.segments) {
                     self.next = Some(Next::Continuation(continuation));
                 }
-                let len = self.buf.get_ref().len() as u64;
-                let event = crate::serialization::Event::Span {
-                    stream: host,
-                    payload: false,
-                    len,
-                };
-                let done = self.next.is_none();
-                let ending = done
-                    && self.continuation_end
-                    && self.source.as_ref().map_or(false, |s| !s.aborted());
-                if ending {
-                    let _ =
-                        self.record(&[event, crate::serialization::Event::End { stream: host }]);
-                } else {
-                    let _ = self.record(&[event]);
-                }
-                if done {
-                    self.source.take();
+                // The buffer was cleared above: the frame is all of it.
+                self.label_header_frame(wire, 0);
+                if self.next.is_none() {
+                    if self.continuation_end {
+                        if let Some(labels) = &self.labels {
+                            labels.end(wire, None);
+                        }
+                    }
                     self.continuation_end = false;
                 }
                 ControlFlow::Continue
             }
-            None => {
-                self.source.take();
-                ControlFlow::Break
-            }
+            None => ControlFlow::Break,
         }
     }
 
@@ -287,31 +270,29 @@ where
 
         tracing::debug!(frame = ?item, "send");
 
-        use crate::serialization::Event;
+        // The label of this frame: its wire stream for the frames that are part of a message (HEADERS,
+        // DATA, RST_STREAM, PUSH_PROMISE), the connection for every other.
         let before = self.buf.get_ref().len();
-        let host = self.source.as_ref().map_or(0, |source| source.identity());
+        let mut wire = 0u32;
         let mut ending = false;
         let mut payload = None;
+        let mut reset = None;
         match &item {
             Frame::Data(frame) => {
+                wire = frame.stream_id().into();
                 ending = frame.is_end_stream();
                 payload = Some(frame.payload().remaining());
             }
             Frame::Headers(frame) => {
+                wire = frame.stream_id().into();
                 ending = frame.is_end_stream();
             }
+            Frame::PushPromise(frame) => wire = frame.stream_id().into(),
+            Frame::Reset(frame) => {
+                wire = frame.stream_id().into();
+                reset = Some(u32::from(frame.reason()));
+            }
             _ => {}
-        }
-        if self.observer.is_some()
-            && matches!(&item, Frame::Data(_) | Frame::Headers(_))
-            && host == 0
-        {
-            self.poisoned = true;
-            return Err(Serialization);
-        }
-        // The scheduler must already have obtained terminal authorization.
-        if ending {
-            self.record(&[Event::ReleaseBarrier { stream: host }])?;
         }
         match item {
             Frame::Data(mut v) => {
@@ -348,7 +329,8 @@ where
             }
             Frame::Headers(v) => {
                 let mut buf = limited_write_buf!(self);
-                if let Some(continuation) = v.encode(&mut self.hpack, &mut buf) {
+                if let Some(continuation) = v.encode(&mut self.hpack, &mut buf, &mut self.segments)
+                {
                     self.next = Some(Next::Continuation(continuation));
                 }
             }
@@ -387,48 +369,35 @@ where
                 tracing::trace!(rem = self.buf.remaining(), "encoded reset");
             }
         }
+        // A DATA frame is whole here even when its payload is chained (written after the buffer); a
+        // header block may continue in CONTINUATION frames, and ends its stream only with the last.
         let done = self.next.is_none() || payload.is_some();
-        let successful_end = ending && done && self.source.as_ref().map_or(false, |s| !s.aborted());
         if let Some(len) = payload {
-            let header = Event::Span {
-                stream: host,
-                payload: false,
-                len: frame::HEADER_LEN as u64,
-            };
-            let body = Event::Span {
-                stream: host,
-                payload: true,
-                len: len as u64,
-            };
-            let end = Event::End { stream: host };
-            match (len != 0, successful_end) {
-                (true, true) => self.record(&[header, body, end])?,
-                (true, false) => self.record(&[header, body])?,
-                (false, true) => self.record(&[header, end])?,
-                (false, false) => self.record(&[header])?,
+            if let Some(labels) = &self.labels {
+                labels.span(wire, false, frame::HEADER_LEN);
+                if len != 0 {
+                    labels.span(wire, true, len);
+                }
+                if ending {
+                    labels.end(wire, None);
+                }
             }
         } else {
-            let span = Event::Span {
-                stream: host,
-                payload: false,
-                len: (self.buf.get_ref().len() - before) as u64,
-            };
-            if successful_end {
-                self.record(&[span, Event::End { stream: host }])?;
-            } else {
-                self.record(&[span])?;
+            self.label_header_frame(wire, before);
+            if let Some(labels) = &self.labels {
+                if let Some(reason) = reset {
+                    labels.end(wire, Some(reason));
+                } else if ending && done {
+                    labels.end(wire, None);
+                }
             }
         }
         self.continuation_end = ending && !done;
-        if self.next.is_none() {
-            self.source.take();
-        }
         Ok(())
     }
 
     fn has_capacity(&self) -> bool {
-        !self.poisoned
-            && self.next.is_none()
+        self.next.is_none()
             && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
                 >= self.min_buffer_capacity)
     }
@@ -448,18 +417,15 @@ impl<B> Encoder<B> {
 }
 
 impl<T, B> FramedWrite<T, B> {
-    pub(crate) fn set_observer(
+    /// Labels every frame this connection encodes. `seal`: sensitive header values and marked path
+    /// places are sealed (a client; a server writes every value it is given).
+    pub(crate) fn set_labels(
         &mut self,
-        observer: std::sync::Arc<dyn crate::serialization::Observer>,
+        labels: std::sync::Arc<dyn crate::serialization::Labels>,
+        seal: bool,
     ) {
-        self.encoder.observer = Some(observer);
-    }
-    pub(crate) fn observer(&self) -> Option<std::sync::Arc<dyn crate::serialization::Observer>> {
-        self.encoder.observer.clone()
-    }
-    pub(crate) fn set_frame_source(&mut self, source: Option<crate::serialization::Source>) {
-        debug_assert!(self.encoder.source.is_none());
-        self.encoder.source = source;
+        self.encoder.labels = Some(labels);
+        self.encoder.hpack.seal.on = seal;
     }
 
     /// Returns the max frame size that can be sent
@@ -515,130 +481,91 @@ mod unstable {
 #[cfg(test)]
 mod serialization_tests {
     use super::*;
-    use crate::serialization::{Event, Observer, ResponseState};
+    use crate::serialization::Labels;
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Default)]
-    struct Capture(Mutex<Vec<Event>>);
-    impl Observer for Capture {
-        fn record(&self, events: &[Event]) -> io::Result<()> {
-            self.0.lock().unwrap().extend_from_slice(events);
-            Ok(())
+    struct Capture(Mutex<Vec<String>>);
+    impl Labels for Capture {
+        fn span(&self, wire: u32, payload: bool, len: usize) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("span {wire} {payload} {len}"));
         }
-        fn bind(&self, _wire: u32, host: u64) -> io::Result<Arc<ResponseState>> {
-            Ok(Arc::new(ResponseState::new(host)))
+        fn sealed(&self, wire: u32, slot: u32, offset: u32, len: u32) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("sealed {wire} {slot} {offset} {len}"));
         }
-        fn reset(&self, _wire: u32) -> io::Result<()> {
-            Ok(())
-        }
-        fn connection_error(&self) -> io::Result<()> {
-            Ok(())
-        }
-        fn poll_release(&self, _host: u64, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+        fn end(&self, wire: u32, failed: Option<u32>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("end {wire} {failed:?}"));
         }
     }
 
-    #[tokio::test]
-    async fn chained_data_is_described_once_before_any_write() {
+    fn writer(seal: bool) -> (FramedWrite<tokio::io::Sink, bytes::Bytes>, Arc<Capture>) {
         let capture = Arc::new(Capture::default());
         let mut writer = FramedWrite::new(tokio::io::sink());
-        writer.set_observer(capture.clone());
-        let source =
-            crate::serialization::Source::new(Arc::new(ResponseState::new(47)), capture.clone());
-        writer.set_frame_source(Some(source));
-        let mut frame = frame::Data::new(1.into(), bytes::Bytes::from(vec![3; 4096]));
-        frame.set_end_stream(true);
-        writer.buffer(frame.into()).unwrap();
-        let events = capture.0.lock().unwrap().clone();
+        writer.set_labels(capture.clone(), seal);
+        (writer, capture)
+    }
+
+    #[test]
+    fn a_data_frame_is_a_control_head_then_payload_and_its_end_stream_ends_the_stream() {
+        let (mut writer, capture) = writer(false);
+        let mut data = frame::Data::new(3.into(), bytes::Bytes::from_static(b"hello"));
+        data.set_end_stream(true);
+        writer.buffer(Frame::Data(data)).unwrap();
         assert_eq!(
-            &events[..4],
-            &[
-                Event::ReleaseBarrier { stream: 47 },
-                Event::Span {
-                    stream: 47,
-                    payload: false,
-                    len: 9
-                },
-                Event::Span {
-                    stream: 47,
-                    payload: true,
-                    len: 4096
-                },
-                Event::End { stream: 47 },
-            ]
-        );
-        std::future::poll_fn(|cx| writer.flush(cx)).await.unwrap();
-        assert_eq!(
-            capture
-                .0
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|e| matches!(e, Event::Span { payload: true, .. }))
-                .count(),
-            1
+            *capture.0.lock().unwrap(),
+            ["span 3 false 9", "span 3 true 5", "end 3 None"]
         );
     }
-    #[tokio::test]
-    async fn terminal_headers_end_only_after_the_last_continuation_unless_aborted() {
-        for aborted in [false, true] {
-            let capture = Arc::new(Capture::default());
-            let state = Arc::new(ResponseState::new(47));
-            let mut writer: FramedWrite<_, bytes::Bytes> = FramedWrite::new(tokio::io::sink());
-            writer.set_observer(capture.clone());
-            writer.set_frame_source(Some(crate::serialization::Source::new(
-                state.clone(),
-                capture.clone(),
-            )));
-            let response = http::Response::builder()
-                .header("large", "x".repeat(65536))
-                .body(())
-                .unwrap();
-            let frame = crate::server::Peer::convert_send_message(1.into(), response, true);
-            writer.buffer(frame.into()).unwrap();
-            assert!(!capture
-                .0
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|e| matches!(e, Event::End { .. })));
-            if aborted {
-                state.abort(capture.as_ref()).unwrap();
-            }
-            std::future::poll_fn(|cx| writer.flush(cx)).await.unwrap();
-            let events = capture.0.lock().unwrap();
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|e| matches!(e, Event::End { stream: 47 }))
-                    .count(),
-                usize::from(!aborted)
-            );
-            assert!(
-                events
-                    .iter()
-                    .filter(|e| matches!(
-                        e,
-                        Event::Span {
-                            stream: 47,
-                            payload: false,
-                            ..
-                        }
-                    ))
-                    .count()
-                    > 1
-            );
-            assert!(!events
-                .iter()
-                .any(|e| matches!(e, Event::Span { payload: true, .. })));
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|e| matches!(e, Event::Quiescent { stream: 47 }))
-                    .count(),
-                1
-            );
-        }
+
+    #[test]
+    fn a_reset_ends_its_stream_failed_and_connection_frames_are_stream_zero() {
+        let (mut writer, capture) = writer(false);
+        writer
+            .buffer(Frame::Reset(frame::Reset::new(
+                5.into(),
+                crate::Reason::CANCEL,
+            )))
+            .unwrap();
+        writer
+            .buffer(Frame::Ping(frame::Ping::new([0; 8])))
+            .unwrap();
+        assert_eq!(
+            *capture.0.lock().unwrap(),
+            ["span 5 false 13", "end 5 Some(8)", "span 0 false 17"]
+        );
+    }
+
+    #[test]
+    fn a_sensitive_value_on_a_sealing_connection_is_never_encoded_and_the_frame_length_counts_it() {
+        let (mut writer, capture) = writer(true);
+        let mut fields = http::HeaderMap::new();
+        let mut secret = http::HeaderValue::from_static("xxxxxxxxxxxxxxxx");
+        secret.set_sensitive(true);
+        fields.insert("authorization", secret);
+        let pseudo = frame::Pseudo::request(
+            http::Method::GET,
+            http::Uri::from_static("https://example.test/v1"),
+            None,
+        );
+        let headers = frame::Headers::new(1.into(), pseudo, fields);
+        writer.buffer(Frame::Headers(headers)).unwrap();
+        let seen = capture.0.lock().unwrap().clone();
+        // Control bytes, the 16 sealed bytes of slot 0, and nothing after them (the value is last).
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].starts_with("span 1 false "));
+        assert_eq!(seen[1], "sealed 1 0 0 16");
+        let encoded = writer.encoder.buf.get_ref();
+        let stated = u32::from_be_bytes([0, encoded[0], encoded[1], encoded[2]]) as usize;
+        assert_eq!(stated, encoded.len() - frame::HEADER_LEN + 16);
+        assert!(!encoded.windows(4).any(|w| w == b"xxxx"));
     }
 }

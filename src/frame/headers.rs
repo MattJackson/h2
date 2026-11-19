@@ -100,11 +100,16 @@ struct HeaderBlock {
     /// Pseudo headers, these are broken out as they must be sent as part of the
     /// headers frame.
     pseudo: Pseudo,
+
+    /// Client request: the places in `:path` where a sealed value goes (`serialization::SealedPath`).
+    sealed_path: Vec<(u32, u32)>,
 }
 
 #[derive(Debug)]
 struct EncodingHeaderBlock {
     hpack: BytesMut,
+    /// The sealed places of the block (`at` indexes `hpack` as it stands), ascending.
+    marks: Vec<crate::serialization::Mark>,
 }
 
 const END_STREAM: u8 = 0x1;
@@ -126,6 +131,7 @@ impl Headers {
                 fields,
                 is_over_size: false,
                 pseudo,
+                sealed_path: Vec::new(),
             },
             flags: HeadersFlag::default(),
         }
@@ -143,6 +149,7 @@ impl Headers {
                 fields,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                sealed_path: Vec::new(),
             },
             flags,
         }
@@ -208,6 +215,7 @@ impl Headers {
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                sealed_path: Vec::new(),
             },
             flags,
         };
@@ -274,20 +282,27 @@ impl Headers {
         self.header_block.fields
     }
 
+    /// Marks the places in `:path` where a sealed value goes.
+    pub fn set_sealed_path(&mut self, spans: Vec<(u32, u32)>) {
+        self.header_block.sealed_path = spans;
+    }
+
     pub fn encode(
-        self,
+        mut self,
         encoder: &mut hpack::Encoder,
         dst: &mut EncodeBuf<'_>,
+        segments: &mut Vec<crate::serialization::Segment>,
     ) -> Option<Continuation> {
         // At this point, the `is_end_headers` flag should always be set
         debug_assert!(self.flags.is_end_headers());
 
         // Get the HEADERS frame head
         let head = self.head();
+        let sealed_path = std::mem::take(&mut self.header_block.sealed_path);
 
         self.header_block
-            .into_encoding(encoder)
-            .encode(&head, dst, Some(encoder), |_| {})
+            .into_encoding(encoder, sealed_path)
+            .encode(&head, dst, Some(encoder), |_| {}, segments)
     }
 
     fn head(&self) -> Head {
@@ -368,6 +383,7 @@ impl PushPromise {
                 fields,
                 is_over_size: false,
                 pseudo,
+                sealed_path: Vec::new(),
             },
             promised_id,
             stream_id,
@@ -459,6 +475,7 @@ impl PushPromise {
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                sealed_path: Vec::new(),
             },
             promised_id,
             stream_id: head.stream_id(),
@@ -506,11 +523,15 @@ impl PushPromise {
         let head = self.head();
         let promised_id = self.promised_id;
 
-        self.header_block
-            .into_encoding(encoder)
-            .encode(&head, dst, Some(encoder), |dst| {
+        self.header_block.into_encoding(encoder, Vec::new()).encode(
+            &head,
+            dst,
+            Some(encoder),
+            |dst| {
                 dst.put_u32(promised_id.into());
-            })
+            },
+            &mut Vec::new(),
+        )
     }
 
     fn head(&self) -> Head {
@@ -543,15 +564,23 @@ impl fmt::Debug for PushPromise {
 // ===== impl Continuation =====
 
 impl Continuation {
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
     fn head(&self) -> Head {
         Head::new(Kind::Continuation, END_HEADERS, self.stream_id)
     }
 
-    pub fn encode(self, dst: &mut EncodeBuf<'_>) -> Option<Continuation> {
+    pub fn encode(
+        self,
+        dst: &mut EncodeBuf<'_>,
+        segments: &mut Vec<crate::serialization::Segment>,
+    ) -> Option<Continuation> {
         // Get the CONTINUATION frame head
         let head = self.head();
 
-        self.header_block.encode(&head, dst, None, |_| {})
+        self.header_block.encode(&head, dst, None, |_| {}, segments)
     }
 }
 
@@ -653,10 +682,14 @@ impl EncodingHeaderBlock {
         dst: &mut EncodeBuf<'_>,
         encoder: Option<&mut hpack::Encoder>,
         f: F,
+        segments: &mut Vec<crate::serialization::Segment>,
     ) -> Option<Continuation>
     where
         F: FnOnce(&mut EncodeBuf<'_>),
     {
+        if !self.marks.is_empty() {
+            return self.encode_sealed(head, dst, f, segments);
+        }
         let head_pos = dst.get_ref().len();
 
         // At this point, we don't know how big the h2 frame will be.
@@ -705,6 +738,92 @@ impl EncodingHeaderBlock {
         }
 
         continuation
+    }
+
+    /// As `encode`, for a block with sealed values. The frame's payload is counted in wire bytes: the
+    /// encoded bytes that are in the buffer and the sealed bytes that are not. A sealed value that does
+    /// not fit the frame continues in the next, from the offset this frame reached. `segments` receives
+    /// the frame as it was laid out, its 9-byte head in the first run.
+    fn encode_sealed<F>(
+        mut self,
+        head: &Head,
+        dst: &mut EncodeBuf<'_>,
+        f: F,
+        segments: &mut Vec<crate::serialization::Segment>,
+    ) -> Option<Continuation>
+    where
+        F: FnOnce(&mut EncodeBuf<'_>),
+    {
+        use crate::serialization::Segment;
+
+        let head_pos = dst.get_ref().len();
+        head.encode(0, dst);
+        let payload_pos = dst.get_ref().len();
+        f(dst);
+
+        // What the frame may still carry, in wire bytes, and what it carries so far.
+        let mut room = dst.remaining_mut();
+        let mut wire = dst.get_ref().len() - payload_pos;
+        // Encoded bytes not yet stated as a run: the frame head and what `f` wrote.
+        let mut run = dst.get_ref().len() - head_pos;
+        segments.clear();
+
+        while room > 0 {
+            match self.marks.first().map(|mark| mark.at) {
+                Some(0) => {
+                    let mark = &mut self.marks[0];
+                    let n = (mark.len as usize).min(room);
+                    if run > 0 {
+                        segments.push(Segment::Bytes(run));
+                        run = 0;
+                    }
+                    segments.push(Segment::Sealed {
+                        slot: mark.slot,
+                        offset: mark.offset,
+                        len: n as u32,
+                    });
+                    mark.offset += n as u32;
+                    mark.len -= n as u32;
+                    room -= n;
+                    wire += n;
+                    if mark.len == 0 {
+                        self.marks.remove(0);
+                    }
+                }
+                next => {
+                    let before_mark = next.unwrap_or(self.hpack.len()).min(self.hpack.len());
+                    if before_mark == 0 {
+                        break;
+                    }
+                    let n = before_mark.min(room);
+                    let part = self.hpack.split_to(n);
+                    dst.put_slice(&part);
+                    for mark in &mut self.marks {
+                        mark.at -= n;
+                    }
+                    run += n;
+                    room -= n;
+                    wire += n;
+                }
+            }
+        }
+        if run > 0 {
+            segments.push(Segment::Bytes(run));
+        }
+
+        let payload_len_be = (wire as u64).to_be_bytes();
+        assert!(payload_len_be[0..5].iter().all(|b| *b == 0));
+        (dst.get_mut()[head_pos..head_pos + 3]).copy_from_slice(&payload_len_be[5..]);
+
+        if self.hpack.is_empty() && self.marks.is_empty() {
+            return None;
+        }
+        debug_assert!(dst.get_ref()[head_pos + 4] & END_HEADERS == END_HEADERS);
+        dst.get_mut()[head_pos + 4] -= END_HEADERS;
+        Some(Continuation {
+            stream_id: head.stream_id(),
+            header_block: self,
+        })
     }
 }
 
@@ -989,7 +1108,11 @@ impl HeaderBlock {
         Ok(())
     }
 
-    fn into_encoding(self, encoder: &mut hpack::Encoder) -> EncodingHeaderBlock {
+    fn into_encoding(
+        self,
+        encoder: &mut hpack::Encoder,
+        sealed_path: Vec<(u32, u32)>,
+    ) -> EncodingHeaderBlock {
         let mut hpack = encoder.take_scratch();
         hpack.clear();
         let headers = Iter {
@@ -997,9 +1120,13 @@ impl HeaderBlock {
             fields: self.fields.into_iter(),
         };
 
+        encoder.seal.begin(sealed_path);
         encoder.encode(headers, &mut hpack);
 
-        EncodingHeaderBlock { hpack }
+        EncodingHeaderBlock {
+            hpack,
+            marks: encoder.seal.take(),
+        }
     }
 
     /// Calculates the size of the currently decoded header list.

@@ -1,136 +1,93 @@
-//! Exact server serialization facts, independent of delivery receipts.
-use std::{
-    fmt, io,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
-    },
-    task::{Context, Poll},
-};
+//! Optional labels for outgoing bytes, on both roles.
+//!
+//! A connection built with a [`Labels`] sink reports, in the order it encodes, which wire stream each
+//! run of encoded bytes belongs to, whether the run is DATA payload or control, where a sealed header
+//! value goes, and when a stream's last frame is encoded. The labels describe encoded bytes, never
+//! socket progress. Every call is infallible and synchronous: nothing is batched, held or bound.
 
-/// A serializer event in connection byte order.
+use std::fmt;
+
+/// A connection's label sink. `wire` is the stream identifier of the frame; 0 is the connection.
+pub trait Labels: Send + Sync + fmt::Debug {
+    /// `len` bytes (never 0) were encoded for `wire`. `payload`: DATA frame payload, one for one.
+    /// Everything else is control: frame heads, header blocks, padding, RST_STREAM. Frames that are
+    /// about a stream but not part of its message (WINDOW_UPDATE, PRIORITY) are reported on 0.
+    fn span(&self, wire: u32, payload: bool, len: usize);
+    /// Bytes `offset..offset + len` of sealed value `slot` of `wire` belong here. Nothing was encoded
+    /// for them; the frame's length counts them.
+    fn sealed(&self, wire: u32, slot: u32, offset: u32, len: u32);
+    /// The last frame of `wire` is encoded: END_STREAM (`None`) or RST_STREAM (its reason).
+    fn end(&self, wire: u32, failed: Option<u32>);
+}
+
+/// Request extension (client): the places in `:path` where a sealed value goes, as `(offset, len)` into
+/// the path as supplied, ascending and not overlapping. The path holds a filler of `len` bytes at each;
+/// no byte of a filler is encoded. The spans are slots 0, 1, 2, ... in order.
+///
+/// On a connection with a sink, a header value marked sensitive is a sealed value as well: a
+/// never-indexed literal, not Huffman-coded, whose length is stated and whose bytes are not encoded.
+/// Header slots are numbered in encoding order after the path's.
+#[derive(Clone, Debug, Default)]
+pub struct SealedPath(pub Vec<(u32, u32)>);
+
+/// One sealed place in an encoded header block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Event {
-    /// An actual nonempty encoded span.
-    Span {
-        /// Admitted application response identity (zero only for connection control).
-        stream: u64,
-        /// True only for actual DATA application bytes.
-        payload: bool,
-        /// Exact nonzero encoded length.
-        len: u64,
-    },
-    /// The terminal unit was authorized before scheduler admission.
-    ReleaseBarrier {
-        /// Admitted application response identity.
-        stream: u64,
-    },
-    /// The last response frame has been fully encoded.
-    End {
-        /// Admitted application response identity.
-        stream: u64,
-    },
-    /// Response serialization failed.
-    Abort {
-        /// Admitted application response identity.
-        stream: u64,
-    },
-    /// No protocol producer or active codec frame retains this response.
-    Quiescent {
-        /// Admitted application response identity.
-        stream: u64,
-    },
+pub(crate) struct Mark {
+    /// Index into the block's encoded bytes (the sealed bytes themselves are not there).
+    pub(crate) at: usize,
+    pub(crate) slot: u32,
+    /// The first byte of the slot not yet placed in a frame.
+    pub(crate) offset: u32,
+    /// Bytes of the slot still to place.
+    pub(crate) len: u32,
 }
 
-/// Bounded connection observer. It must retain bindings until host settlement
-/// and input retirement, independently of application stream handles.
-pub trait Observer: Send + Sync + fmt::Debug {
-    /// Atomically append a complete finite batch, or accept nothing.
-    fn record(&self, events: &[Event]) -> io::Result<()>;
-    /// Bind an actual responder wire ID to an admitted application identity.
-    fn bind(&self, wire: u32, host: u64) -> io::Result<Arc<ResponseState>>;
-    /// Observe a peer reset even if h2 no longer has an application stream.
-    fn reset(&self, wire: u32) -> io::Result<()>;
-    /// Abort all still-live bindings on a genuine connection error.
-    fn connection_error(&self) -> io::Result<()>;
-    /// Poll terminal authorization using one reserved waker per response.
-    fn poll_release(&self, host: u64, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+/// What the header encoder seals in the block it is encoding.
+#[derive(Debug, Default)]
+pub(crate) struct Seal {
+    /// The connection has a sink: sensitive values are sealed.
+    pub(crate) on: bool,
+    /// The spans of `:path` for the block being encoded.
+    pub(crate) path: Vec<(u32, u32)>,
+    /// The marks of the block being encoded, ascending.
+    pub(crate) marks: Vec<Mark>,
+    next_slot: u32,
+    /// Where the block being encoded starts in the encoder's buffer.
+    pub(crate) base: usize,
 }
 
-/// Identity and abort latch shared only by actual serializer producers and the
-/// bounded live association. Application SendStream clones do not count.
-#[derive(Debug)]
-pub struct ResponseState {
-    host: u64,
-    aborted: AtomicBool,
-    sources: AtomicUsize,
-}
-impl ResponseState {
-    /// Create a state for a nonzero, admitted application identity.
-    pub fn new(host: u64) -> Self {
-        assert_ne!(host, 0);
-        Self {
-            host,
-            aborted: AtomicBool::new(false),
-            sources: AtomicUsize::new(0),
-        }
+impl Seal {
+    /// Starts a block.
+    pub(crate) fn begin(&mut self, path: Vec<(u32, u32)>) {
+        self.path = path;
+        self.marks.clear();
+        self.next_slot = 0;
     }
-    /// Application identity, never an integer cast of the wire ID.
-    pub fn identity(&self) -> u64 {
-        self.host
-    }
-    /// Latch and report failure once, preserving any prior byte facts.
-    pub fn abort(&self, observer: &dyn Observer) -> io::Result<()> {
-        if !self.aborted.swap(true, Ordering::AcqRel) {
-            observer.record(&[Event::Abort { stream: self.host }])?;
+    /// A sealed value of `len` bytes belongs at `at` of the block.
+    pub(crate) fn mark(&mut self, at: usize, len: usize) {
+        if len == 0 {
+            return;
         }
-        Ok(())
+        self.marks.push(Mark {
+            at,
+            slot: self.next_slot,
+            offset: 0,
+            len: len as u32,
+        });
+        self.next_slot += 1;
+    }
+    /// The block's marks, leaving none (and no memory when there were none).
+    pub(crate) fn take(&mut self) -> Vec<Mark> {
+        self.path = Vec::new();
+        std::mem::take(&mut self.marks)
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct Source {
-    state: Arc<ResponseState>,
-    observer: Arc<dyn Observer>,
-}
-impl Source {
-    pub(crate) fn new(state: Arc<ResponseState>, observer: Arc<dyn Observer>) -> Self {
-        let old = state.sources.fetch_add(1, Ordering::Relaxed);
-        assert!(old < usize::MAX / 2);
-        Self { state, observer }
-    }
-    pub(crate) fn identity(&self) -> u64 {
-        self.state.host
-    }
-    pub(crate) fn aborted(&self) -> bool {
-        self.state.aborted.load(Ordering::Acquire)
-    }
-    pub(crate) fn abort(&self) {
-        // Lifecycle notification storage is reserved at bind. An observer must
-        // latch its own connection fault if this notification cannot be stored.
-        let _ = self.state.abort(self.observer.as_ref());
-    }
-    pub(crate) fn poll_release(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.aborted() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "response aborted",
-            )));
-        }
-        self.observer.poll_release(self.state.host, cx)
-    }
-}
-impl Clone for Source {
-    fn clone(&self) -> Self {
-        Self::new(self.state.clone(), self.observer.clone())
-    }
-}
-impl Drop for Source {
-    fn drop(&mut self) {
-        if self.state.sources.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let _ = self.observer.record(&[Event::Quiescent {
-                stream: self.state.host,
-            }]);
-        }
-    }
+/// One run of a header frame's payload as it was placed in the frame, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Segment {
+    /// Encoded bytes (the frame head included in the first).
+    Bytes(usize),
+    /// Sealed bytes: counted by the frame's length, absent from the buffer.
+    Sealed { slot: u32, offset: u32, len: u32 },
 }

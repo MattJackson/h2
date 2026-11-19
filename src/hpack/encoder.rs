@@ -18,6 +18,8 @@ pub struct Encoder {
     /// across frames instead of being allocated and freed per frame. See
     /// `take_scratch` / `return_scratch`.
     scratch: BytesMut,
+    /// The sealed values of the block being encoded (off unless the connection labels its output).
+    pub(crate) seal: crate::serialization::Seal,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -35,6 +37,7 @@ impl Encoder {
             max_allowed_size: DEFAULT_MAX_ALLOWED_SIZE,
             size_update: None,
             scratch: BytesMut::new(),
+            seal: crate::serialization::Seal::default(),
         }
     }
 
@@ -105,11 +108,37 @@ impl Encoder {
         let span = tracing::trace_span!("hpack::encode");
         let _e = span.enter();
 
+        self.seal.base = dst.len();
         self.encode_size_updates(dst);
 
         let mut last_index = None;
 
         for header in headers {
+            // A path with sealed places: a never-indexed literal on the static name `:path`, not
+            // Huffman-coded, its whole length stated, its fillers left out and marked. It enters
+            // neither dynamic table, so both ends stay in step whatever the value is.
+            if self.seal.on && !self.seal.path.is_empty() {
+                if let Header::Path(ref path) = header {
+                    let path = path.as_str().as_bytes();
+                    encode_int(4, 4, 0b10000, dst);
+                    encode_int(path.len(), 7, 0, dst);
+                    let spans = std::mem::take(&mut self.seal.path);
+                    let mut at = 0usize;
+                    for (offset, len) in spans {
+                        let (offset, len) = (offset as usize, len as usize);
+                        let (offset, end) =
+                            (offset.min(path.len()), (offset + len).min(path.len()));
+                        if offset < at {
+                            continue;
+                        }
+                        dst.put_slice(&path[at..offset]);
+                        self.seal.mark(dst.len() - self.seal.base, end - offset);
+                        at = end;
+                    }
+                    dst.put_slice(&path[at..]);
+                    continue;
+                }
+            }
             match header.reify() {
                 // The header has an associated name. In which case, try to
                 // index it in the table.
@@ -160,7 +189,13 @@ impl Encoder {
             Index::Name(idx, _) => {
                 let header = self.table.resolve(index);
 
-                encode_not_indexed(idx, header.value_slice(), header.is_sensitive(), dst);
+                encode_not_indexed(
+                    idx,
+                    header.value_slice(),
+                    header.is_sensitive(),
+                    &mut self.seal,
+                    dst,
+                );
             }
             Index::Inserted(_) => {
                 let header = self.table.resolve(index);
@@ -187,6 +222,7 @@ impl Encoder {
                     header.name().as_slice(),
                     header.value_slice(),
                     header.is_sensitive(),
+                    &mut self.seal,
                     dst,
                 );
             }
@@ -206,7 +242,13 @@ impl Encoder {
             | Index::InsertedValue(..) => {
                 let idx = self.table.resolve_idx(last);
 
-                encode_not_indexed(idx, value.as_ref(), value.is_sensitive(), dst);
+                encode_not_indexed(
+                    idx,
+                    value.as_ref(),
+                    value.is_sensitive(),
+                    &mut self.seal,
+                    dst,
+                );
             }
             Index::NotIndexed(_) => {
                 let last = self.table.resolve(last);
@@ -215,6 +257,7 @@ impl Encoder {
                     last.name().as_slice(),
                     value.as_ref(),
                     value.is_sensitive(),
+                    &mut self.seal,
                     dst,
                 );
             }
@@ -232,17 +275,45 @@ fn encode_size_update(val: usize, dst: &mut BytesMut) {
     encode_int(val, 5, 0b0010_0000, dst)
 }
 
-fn encode_not_indexed(name: usize, value: &[u8], sensitive: bool, dst: &mut BytesMut) {
+fn encode_not_indexed(
+    name: usize,
+    value: &[u8],
+    sensitive: bool,
+    seal: &mut crate::serialization::Seal,
+    dst: &mut BytesMut,
+) {
     if sensitive {
         encode_int(name, 4, 0b10000, dst);
     } else {
         encode_int(name, 4, 0, dst);
     }
 
-    encode_str(value, dst);
+    encode_value(value, sensitive, seal, dst);
 }
 
-fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut BytesMut) {
+/// A literal's value. On a labelled connection a sensitive value is sealed: its length is stated raw
+/// (no Huffman coding, so the length on the wire is the value's) and its bytes are left out and marked.
+fn encode_value(
+    value: &[u8],
+    sensitive: bool,
+    seal: &mut crate::serialization::Seal,
+    dst: &mut BytesMut,
+) {
+    if sensitive && seal.on && !value.is_empty() {
+        encode_int(value.len(), 7, 0, dst);
+        seal.mark(dst.len() - seal.base, value.len());
+    } else {
+        encode_str(value, dst);
+    }
+}
+
+fn encode_not_indexed2(
+    name: &[u8],
+    value: &[u8],
+    sensitive: bool,
+    seal: &mut crate::serialization::Seal,
+    dst: &mut BytesMut,
+) {
     if sensitive {
         dst.put_u8(0b10000);
     } else {
@@ -250,7 +321,7 @@ fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut Byt
     }
 
     encode_str(name, dst);
-    encode_str(value, dst);
+    encode_value(value, sensitive, seal, dst);
 }
 
 fn encode_str(val: &[u8], dst: &mut BytesMut) {

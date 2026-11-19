@@ -307,6 +307,9 @@ pub struct PushPromises {
 /// ```
 #[derive(Clone, Debug)]
 pub struct Builder {
+    /// The label sink, when the connection labels its output.
+    labels: Option<std::sync::Arc<dyn crate::serialization::Labels>>,
+
     /// Time to keep locally reset streams around before reaping.
     reset_stream_duration: Duration,
 
@@ -659,6 +662,7 @@ impl Builder {
     /// ```
     pub fn new() -> Builder {
         Builder {
+            labels: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
@@ -1265,6 +1269,19 @@ impl Default for Builder {
     }
 }
 
+impl Builder {
+    /// Label every byte this connection encodes (see [`crate::serialization::Labels`]): each frame
+    /// under its wire stream identifier. A request header value marked sensitive, and each place a
+    /// [`crate::serialization::SealedPath`] extension marks, is then a sealed value: never encoded.
+    pub fn labels(
+        &mut self,
+        labels: std::sync::Arc<dyn crate::serialization::Labels>,
+    ) -> &mut Self {
+        self.labels = Some(labels);
+        self
+    }
+}
+
 /// Creates a new configured HTTP/2 client with default configuration
 /// values backed by `io`.
 ///
@@ -1340,6 +1357,10 @@ where
 
         // Create the codec
         let mut codec = Codec::new(io);
+        // A client seals: a sensitive request header value is never encoded.
+        if let Some(labels) = &builder.labels {
+            codec.set_labels(labels.clone(), true);
+        }
 
         if let Some(max) = builder.settings.max_frame_size() {
             codec.set_max_recv_frame_size(max as usize);
@@ -1651,10 +1672,15 @@ impl Peer {
                 uri,
                 headers,
                 version,
+                mut extensions,
                 ..
             },
             _,
         ) = request.into_parts();
+        // Places in the path where a sealed value goes (a labelled connection).
+        let sealed_path = extensions
+            .remove::<crate::serialization::SealedPath>()
+            .map(|sealed| sealed.0);
 
         let is_connect = method == Method::CONNECT;
 
@@ -1692,6 +1718,9 @@ impl Peer {
 
         // Create the HEADERS frame
         let mut frame = Headers::new(id, pseudo, headers);
+        if let Some(spans) = sealed_path {
+            frame.set_sealed_path(spans);
+        }
 
         if end_of_stream {
             frame.set_end_stream()

@@ -234,7 +234,8 @@ pub struct Connection<T, B: Buf> {
 /// ```
 #[derive(Clone, Debug)]
 pub struct Builder {
-    observer: Option<std::sync::Arc<dyn crate::serialization::Observer>>,
+    /// The label sink, when the connection labels its output.
+    labels: Option<std::sync::Arc<dyn crate::serialization::Labels>>,
     /// Time to keep locally reset streams around before reaping.
     reset_stream_duration: Duration,
 
@@ -388,8 +389,9 @@ where
 
         // Create the codec.
         let mut codec = Codec::new(io);
-        if let Some(observer) = &builder.observer {
-            codec.set_observer(observer.clone());
+        // A server writes every header value it is given: nothing is sealed.
+        if let Some(labels) = &builder.labels {
+            codec.set_labels(labels.clone(), false);
         }
 
         if let Some(max) = builder.settings.max_frame_size() {
@@ -632,12 +634,13 @@ where
 // ===== impl Builder =====
 
 impl Builder {
-    /// Install a bounded exact server serialization observer.
-    pub fn serialization_observer(
+    /// Label every byte this connection encodes (see [`crate::serialization::Labels`]): each frame
+    /// under its wire stream identifier.
+    pub fn labels(
         &mut self,
-        observer: std::sync::Arc<dyn crate::serialization::Observer>,
+        labels: std::sync::Arc<dyn crate::serialization::Labels>,
     ) -> &mut Self {
-        self.observer = Some(observer);
+        self.labels = Some(labels);
         self
     }
 
@@ -674,7 +677,7 @@ impl Builder {
             settings: Settings::default(),
             initial_target_connection_window_size: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
-            observer: None,
+            labels: None,
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             data_frame_budget: proto::DataFrameBudget::Auto,
         }
