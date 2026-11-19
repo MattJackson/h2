@@ -24,8 +24,6 @@ use std::{
 /// idle stream is opened first.
 #[derive(Debug)]
 pub(super) struct Prioritize {
-    release_blocked: store::Queue<stream::NextRelease>,
-    scheduled_source: Option<crate::serialization::Source>,
     /// Queue of streams waiting for socket capacity to send a frame.
     pending_send: store::Queue<stream::NextSend>,
 
@@ -96,8 +94,6 @@ impl Prioritize {
         tracing::trace!("Prioritize::new; flow={:?}", flow);
 
         Prioritize {
-            release_blocked: store::Queue::new(),
-            scheduled_source: None,
             pending_send: store::Queue::new(),
             pending_capacity: store::Queue::new(),
             pending_open: store::Queue::new(),
@@ -414,7 +410,7 @@ impl Prioritize {
     fn try_assign_capacity(&mut self, stream: &mut store::Ptr) {
         // Streams over the max concurrent count should not have capacity assign to avoid starving the connection
         // capacity for open streams
-        if stream.is_pending_open || stream.is_release_blocked {
+        if stream.is_pending_open {
             return;
         }
 
@@ -515,41 +511,12 @@ impl Prioritize {
         store: &mut Store,
         counts: &mut Counts,
         dst: &mut Codec<T, Prioritized<B>>,
-        cx: &mut std::task::Context<'_>,
     ) -> io::Result<BufferStatus>
     where
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        // Poll each held response once per connection wake. The separate
-        // intrusive queue owns no additional payload or connection flow credit.
-        let mut waiting = store::Queue::<stream::NextRelease>::new();
-        while let Some(mut stream) = self.release_blocked.pop(store) {
-            let ready = match stream.response_source.as_ref() {
-                None => true,
-                Some(source) => match source.poll_release(cx) {
-                    std::task::Poll::Pending => false,
-                    std::task::Poll::Ready(Ok(())) => true,
-                    std::task::Poll::Ready(Err(_)) => {
-                        source.abort();
-                        self.clear_queue(buffer, &mut stream);
-                        stream.set_reset(Reason::CANCEL, Initiator::Library);
-                        let reset = frame::Reset::new(stream.id, Reason::CANCEL);
-                        stream.pending_send.push_front(buffer, reset.into());
-                        true
-                    }
-                },
-            };
-            if ready {
-                self.try_assign_capacity(&mut stream);
-                self.pending_send.push(&mut stream);
-            } else {
-                waiting.push(&mut stream);
-            }
-        }
-        self.release_blocked = waiting;
         // Reclaim any frame that has previously been written
-
         self.reclaim_frame(buffer, store, dst);
 
         // The max frame length
@@ -567,7 +534,7 @@ impl Prioritize {
                 self.try_assign_capacity(&mut stream);
             }
 
-            match self.pop_frame(buffer, store, max_frame_len, counts, cx) {
+            match self.pop_frame(buffer, store, max_frame_len, counts) {
                 Some(frame) => {
                     tracing::trace!(?frame, "writing");
 
@@ -575,9 +542,7 @@ impl Prioritize {
                     if let Frame::Data(ref frame) = frame {
                         self.in_flight_data_frame = InFlightData::DataFrame(frame.payload().stream);
                     }
-                    dst.set_frame_source(self.scheduled_source.take());
-                    dst.buffer(frame)
-                        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+                    dst.buffer(frame).expect("invalid frame");
 
                     // Small DATA frames can be fully encoded by `buffer`,
                     // which records completion in a single codec slot. Reclaim
@@ -708,7 +673,6 @@ impl Prioritize {
             tracing::trace!(?frame, "dropping");
         }
 
-        stream.response_source.take();
         stream.buffered_send_data = 0;
         stream.requested_send_capacity = 0;
         if let InFlightData::DataFrame(key) = self.in_flight_data_frame {
@@ -720,11 +684,6 @@ impl Prioritize {
     }
 
     pub fn clear_pending_send(&mut self, store: &mut Store, counts: &mut Counts) {
-        while let Some(stream) = self.release_blocked.pop(store) {
-            let reset = stream.is_pending_reset_expiration();
-            counts.transition_after(stream, reset);
-        }
-
         while let Some(mut stream) = self.pending_send.pop(store) {
             if let Some(reason) = stream.state.get_scheduled_reset() {
                 stream.set_reset(reason, Initiator::Library);
@@ -745,7 +704,6 @@ impl Prioritize {
         store: &mut Store,
         max_len: usize,
         counts: &mut Counts,
-        cx: &mut std::task::Context<'_>,
     ) -> Option<Frame<Prioritized<B>>>
     where
         B: Buf,
@@ -832,24 +790,6 @@ impl Prioritize {
                         continue;
                     }
 
-                    if frame.is_end_stream()
-                        && len as usize == sz
-                        && stream.response_source.as_ref().map_or(false, |source| {
-                            match source.poll_release(cx) {
-                                std::task::Poll::Ready(Ok(())) => false,
-                                std::task::Poll::Pending => true,
-                                std::task::Poll::Ready(Err(_)) => {
-                                    source.abort();
-                                    true
-                                }
-                            }
-                        })
-                    {
-                        stream.pending_send.push_front(buffer, frame.into());
-                        self.release_blocked.push(&mut stream);
-                        self.reclaim_all_capacity(&mut stream, counts);
-                        continue;
-                    }
                     tracing::trace!(len, "sending data frame");
 
                     // Update the flow control
@@ -887,25 +827,6 @@ impl Prioritize {
                         end_of_stream: eos,
                         stream: stream.key(),
                     }))
-                }
-                Some(Frame::Headers(frame))
-                    if frame.is_end_stream()
-                        && stream
-                            .response_source
-                            .as_ref()
-                            .map_or(false, |source| match source.poll_release(cx) {
-                                std::task::Poll::Ready(Ok(())) => false,
-                                std::task::Poll::Pending => true,
-                                std::task::Poll::Ready(Err(_)) => {
-                                    source.abort();
-                                    true
-                                }
-                            }) =>
-                {
-                    stream.pending_send.push_front(buffer, frame.into());
-                    self.release_blocked.push(&mut stream);
-                    self.reclaim_all_capacity(&mut stream, counts);
-                    continue;
                 }
                 Some(Frame::PushPromise(pp)) => {
                     let mut pushed = stream.store_mut().find_mut(&pp.promised_id()).unwrap();
@@ -956,17 +877,6 @@ impl Prioritize {
                 self.last_opened_id = stream.id;
             }
 
-            if matches!(&frame, Frame::Data(_) | Frame::Headers(_)) {
-                self.scheduled_source = stream.response_source.clone();
-            }
-            let terminal = match &frame {
-                Frame::Data(frame) => frame.is_end_stream(),
-                Frame::Headers(frame) => frame.is_end_stream(),
-                _ => false,
-            };
-            if terminal {
-                stream.response_source.take();
-            }
             if !stream.pending_send.is_empty() || stream.state.is_scheduled_reset() {
                 // TODO: Only requeue the sender IF it is ready to send
                 // the next frame. i.e. don't requeue it if the next

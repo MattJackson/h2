@@ -162,8 +162,7 @@ where
                 data_frame_budget: config.data_frame_budget,
             }
         }
-        let mut streams = Streams::new(streams_config(&config));
-        streams.set_observer(codec.observer());
+        let streams = Streams::new(streams_config(&config));
         let span = tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         span.follows_from(tracing::Span::current());
         Connection {
