@@ -59,17 +59,12 @@ where
 }
 
 impl<T, B> Codec<T, B> {
-    pub(crate) fn set_observer(
+    pub(crate) fn set_labels(
         &mut self,
-        observer: std::sync::Arc<dyn crate::serialization::Observer>,
+        labels: std::sync::Arc<dyn crate::serialization::Labels>,
+        seal: bool,
     ) {
-        self.framed_write().set_observer(observer);
-    }
-    pub(crate) fn observer(&self) -> Option<std::sync::Arc<dyn crate::serialization::Observer>> {
-        self.inner.get_ref().observer()
-    }
-    pub(crate) fn set_frame_source(&mut self, source: Option<crate::serialization::Source>) {
-        self.framed_write().set_frame_source(source);
+        self.framed_write().set_labels(labels, seal);
     }
 
     /// Updates the max received frame size.
