@@ -1353,6 +1353,11 @@ where
         mut io: T,
         builder: Builder,
     ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
+        // The preface is written straight to the connection, not through the frame encoder: it is
+        // labelled here, as the connection's own, before the first of its bytes is written.
+        if let Some(labels) = &builder.labels {
+            labels.span(0, false, 24);
+        }
         bind_connection(&mut io).await?;
 
         // Create the codec
