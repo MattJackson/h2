@@ -2,11 +2,12 @@ use super::{util, StreamDependency, StreamId};
 use crate::ext::Protocol;
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
+use crate::wipe::WipingBuf;
 
 use http::header::{self, HeaderName, HeaderValue};
 use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 
 use std::fmt;
 use std::io::Cursor;
@@ -158,7 +159,11 @@ impl Headers {
     /// Loads the header frame but doesn't actually do HPACK decoding.
     ///
     /// HPACK decoding is done in the `load_hpack` step.
-    pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
+    ///
+    /// `src` is a header block from the peer: what is skipped (the pad length, the priority) and cut (the
+    /// padding) is wiped, and so is all of it when the frame is refused.
+    pub fn load(head: Head, src: BytesMut) -> Result<(Self, BytesMut), Error> {
+        let mut src = WipingBuf::from(src);
         let flags = HeadersFlag(head.flag());
         let mut pad = 0;
 
@@ -220,7 +225,7 @@ impl Headers {
             flags,
         };
 
-        Ok((headers, src))
+        Ok((headers, src.into_inner()))
     }
 
     pub fn load_hpack(
@@ -430,7 +435,10 @@ impl PushPromise {
     /// Loads the push promise frame but doesn't actually do HPACK decoding.
     ///
     /// HPACK decoding is done in the `load_hpack` step.
-    pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
+    ///
+    /// `src` is wiped as in [`Headers::load`].
+    pub fn load(head: Head, src: BytesMut) -> Result<(Self, BytesMut), Error> {
+        let mut src = WipingBuf::from(src);
         let flags = PushPromiseFlag(head.flag());
         let mut pad = 0;
 
@@ -480,7 +488,7 @@ impl PushPromise {
             promised_id,
             stream_id: head.stream_id(),
         };
-        Ok((frame, src))
+        Ok((frame, src.into_inner()))
     }
 
     pub fn load_hpack(

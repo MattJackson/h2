@@ -1,6 +1,8 @@
 use super::{header::BytesStr, huffman, Header};
 use crate::frame;
 
+use crate::wipe::{self, WipingBuf};
+
 use bytes::{Buf, Bytes, BytesMut};
 use http::header;
 use http::method::{self, Method};
@@ -19,7 +21,9 @@ pub struct Decoder {
     max_size_update: Option<usize>,
     last_max_update: usize,
     table: Table,
-    buffer: BytesMut,
+    // Scratch for Huffman-decoded strings: each is held in a wiping block and wiped here as
+    // it is taken, so the scratch holds only wiped bytes.
+    buffer: WipingBuf,
 }
 
 /// Represents all errors that can be encountered while performing the decoding
@@ -158,7 +162,7 @@ impl Decoder {
             max_size_update: None,
             last_max_update: size,
             table: Table::new(size),
-            buffer: BytesMut::with_capacity(4096),
+            buffer: WipingBuf::with_capacity(4096),
         }
     }
 
@@ -335,10 +339,10 @@ impl Decoder {
         if huff {
             let ret = {
                 let raw = &buf.chunk()[..len];
-                huffman::decode(raw, &mut self.buffer).map(|buf| StringMarker {
+                huffman::decode(raw, &mut self.buffer).map(|mut buf| StringMarker {
                     offset,
                     len,
-                    string: Some(BytesMut::freeze(buf)),
+                    string: Some(wipe::hold(&mut buf)),
                 })
             };
 
@@ -464,12 +468,16 @@ fn peek_u8<B: Buf>(buf: &B) -> Option<u8> {
     }
 }
 
+/// Takes the `n` bytes at the cursor out of the header block, held in a wiping block. Everything
+/// consumed up to them (representations, indexes, lengths, Huffman-coded strings) and the bytes
+/// themselves are wiped in the header block as they leave it.
 fn take(buf: &mut Cursor<&mut BytesMut>, n: usize) -> Bytes {
     let pos = buf.position() as usize;
     let mut head = buf.get_mut().split_to(pos + n);
     buf.set_position(0);
-    head.advance(pos);
-    head.freeze()
+    let taken = wipe::hold(&mut head[pos..]);
+    zeroize::Zeroize::zeroize(&mut head[..pos]);
+    taken
 }
 
 impl StringMarker {
