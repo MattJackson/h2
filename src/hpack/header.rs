@@ -94,9 +94,10 @@ impl Header {
                 _ => Err(DecoderError::InvalidPseudoheader),
             }
         } else {
-            // HTTP/2 requires lower case header names
+            // HTTP/2 requires lower case header names. The value stays in the
+            // wiping block it was decoded into (no copy).
             let name = HeaderName::from_lowercase(&name)?;
-            let value = HeaderValue::from_bytes(&value)?;
+            let value = HeaderValue::from_maybe_shared(value)?;
 
             Ok(Header::Field { name, value })
         }
@@ -231,7 +232,7 @@ impl<'a> Name<'a> {
         match self {
             Name::Field(name) => Ok(Header::Field {
                 name: name.clone(),
-                value: HeaderValue::from_bytes(&value)?,
+                value: HeaderValue::from_maybe_shared(value)?,
             }),
             Name::Authority => Ok(Header::Authority(BytesStr::try_from(value)?)),
             Name::Method => Ok(Header::Method(Method::from_bytes(&value)?)),

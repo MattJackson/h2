@@ -139,7 +139,27 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
     // bytes. One more byte covers the fast path always writing two bytes
     // even when it decoded only one symbol.
     buf.resize(base_len + len * 8 / 5 + 1, 0);
-    let dst = &mut buf[base_len..];
+
+    // The decoded bytes are a peer's header value: what is written past the
+    // decoded length (the fast path's second byte), and all of it when the
+    // input does not decode, is wiped before it leaves the buffer's view.
+    match decode_into(src, &mut buf[base_len..]) {
+        Ok(o) => {
+            zeroize::Zeroize::zeroize(&mut buf[base_len + o..]);
+            buf.truncate(base_len + o);
+            Ok(buf.split())
+        }
+        Err(e) => {
+            zeroize::Zeroize::zeroize(&mut buf[base_len..]);
+            buf.truncate(base_len);
+            Err(e)
+        }
+    }
+}
+
+/// Decodes `src` into `dst` (sized for the worst case); returns the decoded length.
+fn decode_into(src: &[u8], dst: &mut [u8]) -> Result<usize, DecoderError> {
+    let len = src.len();
     let mut o = 0;
 
     let mut acc: u64 = 0;
@@ -201,8 +221,7 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
         decode_code_slow(&mut acc, &mut bits, dst, &mut o)?;
     }
 
-    buf.truncate(base_len + o);
-    Ok(buf.split())
+    Ok(o)
 }
 
 #[cfg(test)]

@@ -5,27 +5,58 @@ use crate::frame::{
 use crate::proto::Error;
 
 use crate::hpack;
+use crate::wipe::{self, WipingBuf};
 
 use futures_core::Stream;
 
-use bytes::{Buf, BytesMut};
+use bytes::BytesMut;
 
 use std::io;
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::AsyncRead;
-use tokio_util::codec::FramedRead as InnerFramedRead;
-use tokio_util::codec::{LengthDelimitedCodec, LengthDelimitedCodecError};
+use tokio_util::io::poll_read_buf;
 
 // 16 MB "sane default" taken from golang http2
 const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
 
 const MAX_FIELDS_HINT: usize = 64;
 
+/// What the read buffer starts with: tokio-util `FramedRead`'s `INITIAL_CAPACITY`, the reader this
+/// one replaces (its buffer freed the peer's bytes unwiped).
+const INITIAL_CAPACITY: usize = 8 * 1024;
+
+/// The frame head starts with the payload length, 24 bits (RFC 9113 section 4.1).
+const LENGTH_LEN: usize = 3;
+
+/// Reads frames off `T` and decodes them.
+///
+/// The frames are cut the way tokio-util's `FramedRead` over a `LengthDelimitedCodec` (3-byte
+/// big-endian length, adjusted by the 9-byte head, nothing skipped) cut them: the same reads, the
+/// same states, the same refusals. The read buffer is a [`WipingBuf`], and so is every frame cut
+/// from it, so no block holding the peer's bytes is freed unwiped.
 #[derive(Debug)]
 pub struct FramedRead<T> {
-    inner: InnerFramedRead<T, LengthDelimitedCodec>,
+    io: T,
+
+    /// What the peer sent and is not yet cut into frames.
+    buf: WipingBuf,
+
+    /// The largest frame payload accepted.
+    max_frame_size: usize,
+
+    /// The whole length (head included) of the frame being read, once its length is in.
+    frame_len: Option<usize>,
+
+    /// The last read returned 0 bytes.
+    eof: bool,
+
+    /// The buffer may hold a frame.
+    is_readable: bool,
+
+    /// The last poll returned an error: the next one returns `None`.
+    has_errored: bool,
 
     decoder: FrameDecoder,
 }
@@ -53,7 +84,7 @@ struct Partial {
     frame: Continuable,
 
     /// Partial header payload
-    buf: BytesMut,
+    buf: WipingBuf,
 
     continuation_frames_count: usize,
 }
@@ -65,23 +96,34 @@ enum Continuable {
 }
 
 impl<T> FramedRead<T> {
-    pub fn new(inner: InnerFramedRead<T, LengthDelimitedCodec>) -> FramedRead<T> {
-        let decoder = FrameDecoder::new(inner.decoder().max_frame_length());
-        FramedRead { inner, decoder }
+    /// A reader accepting frames up to the default max frame size (the caller sets its own with
+    /// [`set_max_frame_size`](Self::set_max_frame_size)).
+    pub fn new(io: T) -> FramedRead<T> {
+        let max_frame_size = DEFAULT_MAX_FRAME_SIZE as usize;
+        FramedRead {
+            io,
+            buf: WipingBuf::with_capacity(INITIAL_CAPACITY),
+            max_frame_size,
+            frame_len: None,
+            eof: false,
+            is_readable: false,
+            has_errored: false,
+            decoder: FrameDecoder::new(max_frame_size),
+        }
     }
 
     pub fn get_ref(&self) -> &T {
-        self.inner.get_ref()
+        &self.io
     }
 
     pub fn get_mut(&mut self) -> &mut T {
-        self.inner.get_mut()
+        &mut self.io
     }
 
     /// Returns the current max frame size setting
     #[inline]
     pub fn max_frame_size(&self) -> usize {
-        self.inner.decoder().max_frame_length()
+        self.max_frame_size
     }
 
     /// Updates the max frame size setting.
@@ -90,7 +132,7 @@ impl<T> FramedRead<T> {
     #[inline]
     pub fn set_max_frame_size(&mut self, val: usize) {
         assert!(DEFAULT_MAX_FRAME_SIZE as usize <= val && val <= MAX_MAX_FRAME_SIZE as usize);
-        self.inner.decoder_mut().set_max_frame_length(val);
+        self.max_frame_size = val;
         // Update max CONTINUATION frames too, since its based on this
         self.decoder.set_max_frame_size(val);
     }
@@ -154,7 +196,7 @@ impl FrameDecoder {
         self.hpack.queue_size_update(val);
     }
 
-    fn decode(&mut self, bytes: BytesMut) -> Result<Option<Frame>, Error> {
+    fn decode(&mut self, bytes: WipingBuf) -> Result<Option<Frame>, Error> {
         decode_frame(self, bytes)
     }
 }
@@ -162,7 +204,7 @@ impl FrameDecoder {
 /// Decodes a frame.
 ///
 /// This function is intentionally de-generified and outlined because it is very large.
-fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Option<Frame>, Error> {
+fn decode_frame(decoder: &mut FrameDecoder, mut bytes: WipingBuf) -> Result<Option<Frame>, Error> {
     let span = tracing::trace_span!("FramedRead::decode_frame", offset = bytes.len());
     let _e = span.enter();
 
@@ -182,11 +224,12 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
 
     macro_rules! header_block {
         ($frame:ident, $head:ident, $bytes:ident) => ({
-            // Drop the frame header
+            // Drop the frame header (wiped)
             $bytes.advance(frame::HEADER_LEN);
 
-            // Parse the header frame w/o parsing the payload
-            let (mut frame, mut payload) = match frame::$frame::load($head, $bytes, decoder.fields_hint) {
+            // Parse the header frame w/o parsing the payload (`load` wipes what it skips, and
+            // all of it when it refuses the frame)
+            let (mut frame, payload) = match frame::$frame::load($head, $bytes.into_inner(), decoder.fields_hint) {
                 Ok(res) => res,
                 Err(frame::Error::InvalidDependencyId) => {
                     proto_err!(stream: "invalid HEADERS dependency ID");
@@ -200,6 +243,9 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
                     return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
             };
+            // The header block: what HPACK takes from it is wiped as it is taken, the rest when
+            // it is dropped (or, partial, when the CONTINUATION frames are done with it).
+            let mut payload = WipingBuf::from(payload);
 
             let is_end_headers = frame.is_end_headers();
 
@@ -271,7 +317,8 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
         }
         Kind::Data => {
             bytes.advance(frame::HEADER_LEN);
-            let res = frame::Data::load(head, bytes.freeze());
+            // The payload outlives the frame: held in a wiping block, wiped in the frame.
+            let res = frame::Data::load(head, wipe::hold(&mut bytes));
 
             // TODO: Should this always be connection level? Probably not...
             res.map_err(|e| {
@@ -439,9 +486,9 @@ where
         let _e = span.enter();
         loop {
             tracing::trace!("poll");
-            let bytes = match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
+            let bytes = match ready!(self.poll_frame(cx)) {
                 Some(Ok(bytes)) => bytes,
-                Some(Err(e)) => return Poll::Ready(Some(Err(map_err(e)))),
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
                 None => return Poll::Ready(None),
             };
 
@@ -454,15 +501,99 @@ where
     }
 }
 
-fn map_err(err: io::Error) -> Error {
-    if let io::ErrorKind::InvalidData = err.kind() {
-        if let Some(custom) = err.get_ref() {
-            if custom.is::<LengthDelimitedCodecError>() {
-                return Error::library_go_away(Reason::FRAME_SIZE_ERROR);
+impl<T> FramedRead<T>
+where
+    T: AsyncRead + Unpin,
+{
+    /// The next whole frame (head and payload), as tokio-util's `FramedRead` polled its codec:
+    /// cut what the buffer holds; else read more; at end of stream, bytes left over that make no
+    /// frame are an error; after an error, `None` once.
+    fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<WipingBuf, Error>>> {
+        loop {
+            if self.has_errored {
+                self.is_readable = false;
+                self.has_errored = false;
+                return Poll::Ready(None);
             }
+
+            if self.is_readable {
+                let cut = self.cut();
+                if let Err(e) = cut {
+                    self.has_errored = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                if let Ok(Some(frame)) = cut {
+                    return Poll::Ready(Some(Ok(frame)));
+                }
+                if self.eof {
+                    if self.buf.is_empty() {
+                        self.is_readable = false;
+                        return Poll::Ready(None);
+                    }
+                    self.has_errored = true;
+                    return Poll::Ready(Some(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "bytes remaining on stream",
+                    )
+                    .into())));
+                }
+                self.is_readable = false;
+            }
+
+            // Room for at least one byte, so a read of 0 means end of stream. The buffer grows
+            // only through its wiping reserve: `poll_read_buf` then reads into the spare room.
+            self.buf.reserve(1);
+            let n = match poll_read_buf(Pin::new(&mut self.io), cx, &mut *self.buf) {
+                Poll::Ready(Ok(n)) => n,
+                Poll::Ready(Err(e)) => {
+                    self.has_errored = true;
+                    return Poll::Ready(Some(Err(e.into())));
+                }
+                Poll::Pending => return Poll::Pending,
+            };
+            if n == 0 {
+                if self.eof {
+                    return Poll::Ready(None);
+                }
+                self.eof = true;
+            } else {
+                self.eof = false;
+            }
+            self.is_readable = true;
         }
     }
-    err.into()
+
+    /// Cuts the next whole frame off the buffer, if it holds one. A length over the max frame
+    /// size is a connection error of type FRAME_SIZE_ERROR (RFC 9113 section 4.2).
+    fn cut(&mut self) -> Result<Option<WipingBuf>, Error> {
+        let n = match self.frame_len {
+            Some(n) => n,
+            None => {
+                if self.buf.len() < LENGTH_LEN {
+                    return Ok(None);
+                }
+                let len = (usize::from(self.buf[0]) << 16)
+                    | (usize::from(self.buf[1]) << 8)
+                    | usize::from(self.buf[2]);
+                if len > self.max_frame_size {
+                    return Err(Error::library_go_away(Reason::FRAME_SIZE_ERROR));
+                }
+                let n = len + frame::HEADER_LEN;
+                // Room for the whole frame.
+                self.buf.reserve(n.saturating_sub(self.buf.len()));
+                self.frame_len = Some(n);
+                n
+            }
+        };
+        if self.buf.len() < n {
+            return Ok(None);
+        }
+        self.frame_len = None;
+        let frame = self.buf.split_to(n);
+        // Room for the next frame's length.
+        self.buf.reserve(LENGTH_LEN.saturating_sub(self.buf.len()));
+        Ok(Some(frame))
+    }
 }
 
 // ===== impl Continuable =====
@@ -535,7 +666,7 @@ mod tests {
     }
 
     fn decode_fields(decoder: &mut FrameDecoder, stream_id: u32, fields: usize) -> HeaderMap {
-        match decode_frame(decoder, headers_frame(stream_id, fields)) {
+        match decode_frame(decoder, WipingBuf::from(headers_frame(stream_id, fields))) {
             Ok(Some(Frame::Headers(headers))) => headers.into_fields(),
             other => panic!("unexpected {other:?}"),
         }
