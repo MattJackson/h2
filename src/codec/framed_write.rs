@@ -208,9 +208,12 @@ where
     /// States the labels of one header frame just encoded for `wire`: the buffer grew from `before`.
     /// With sealed values the frame's payload is runs of encoded bytes around the sealed places.
     fn label_header_frame(&mut self, wire: u32, before: usize) {
-        let Some(labels) = &self.labels else {
-            self.segments.clear();
-            return;
+        let labels = match &self.labels {
+            Some(labels) => labels,
+            None => {
+                self.segments.clear();
+                return;
+            }
         };
         if self.segments.is_empty() {
             labels.span(wire, false, self.buf.get_ref().len() - before);

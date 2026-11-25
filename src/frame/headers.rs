@@ -1205,7 +1205,11 @@ mod test {
         );
 
         let continuation = headers
-            .encode(&mut encoder, &mut (&mut dst).limit(frame::HEADER_LEN + 8))
+            .encode(
+                &mut encoder,
+                &mut (&mut dst).limit(frame::HEADER_LEN + 8),
+                &mut Vec::new(),
+            )
             .unwrap();
 
         assert_eq!(17, dst.len());
@@ -1219,7 +1223,10 @@ mod test {
         dst.clear();
 
         assert!(continuation
-            .encode(&mut (&mut dst).limit(frame::HEADER_LEN + 16))
+            .encode(
+                &mut (&mut dst).limit(frame::HEADER_LEN + 16),
+                &mut Vec::new()
+            )
             .is_none());
 
         world.extend_from_slice(&dst[9..12]);
