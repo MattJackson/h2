@@ -292,7 +292,7 @@ impl Headers {
         self.header_block.sealed_path = spans;
     }
 
-    pub fn encode(
+    pub(crate) fn encode(
         mut self,
         encoder: &mut hpack::Encoder,
         dst: &mut EncodeBuf<'_>,
@@ -580,7 +580,7 @@ impl Continuation {
         Head::new(Kind::Continuation, END_HEADERS, self.stream_id)
     }
 
-    pub fn encode(
+    pub(crate) fn encode(
         self,
         dst: &mut EncodeBuf<'_>,
         segments: &mut Vec<crate::serialization::Segment>,

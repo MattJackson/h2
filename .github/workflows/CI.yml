@@ -119,6 +119,7 @@ jobs:
           cargo update --package tracing-subscriber --precise 0.3.19
           cargo update --package tracing-core --precise 0.1.33
           cargo update --package itoa --precise 1.0.15
+          cargo update --package zeroize --precise 1.8.1
 
 
       - run: cargo check -p h2
